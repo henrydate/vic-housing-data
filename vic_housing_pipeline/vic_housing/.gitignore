@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Pipeline outputs (too large / generated — don't commit)
+cache/
+logs/
+exports/*.csv
+exports/*.xlsx
+vic_housing.db
+
+# Keep the placeholder files
+!cache/.gitkeep
+!logs/.gitkeep
+!exports/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
