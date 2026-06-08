@@ -8,6 +8,11 @@ on Victorian housing policy.
 
 Built end-to-end: data engineering (resilient connectors) → storage → econometric analysis → reporting.
 
+> **Part of a three-state series**, each adapted to that state's free-data landscape:
+> [`vic-housing-data`](https://github.com/henrydate/vic-housing-data) (suburb medians + policy DiD) ·
+> [`qld-housing-data`](https://github.com/henrydate/qld-housing-data) (RTA suburb rents + interactive postcode explorer) ·
+> [`nsw-housing-data`](https://github.com/henrydate/nsw-housing-data) (Valuer-General **transaction-level** sales).
+
 ---
 
 ## Headline findings
