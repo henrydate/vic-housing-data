@@ -44,6 +44,7 @@ Reproduced live in `vic_housing_notebook.ipynb` and `analysis/`:
 | `cashrate` | RBA table **F1.1** — Cash Rate Target | Monthly | Policy cash rate, 1990–present |
 | `capitals` | ABS Data API — **RES_DWELL** | Quarterly | Median house/unit price for **every capital city** (interstate control) |
 | `asx` | ASX (MarkitDigital backend) | Recent | Property-sector filings (MGR, SGP, LLC, GMG, REA, VCX, CQR, CLW, HMC, DXS) |
+| `drivers` | [ABS ERP_COMP_Q](https://data.api.abs.gov.au/) | Quarterly | demand drivers: net interstate & overseas migration, population growth |
 
 ### A note on resilience (the interesting engineering)
 
@@ -90,6 +91,7 @@ analysis/
 | `building_approvals` | period, region, dwelling_type, seasonality → num_approvals |
 | `lending_rates` | period, series_id → rate_pct, series_label |
 | `cash_rate` | period → rate_pct |
+| `state_drivers` | period × measure → value (migration, population growth) |
 | `capital_prices` | period, region, measure → value |
 | `asx_announcements` | ticker, announced_at, headline → url |
 

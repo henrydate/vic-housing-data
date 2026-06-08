@@ -216,6 +216,16 @@ CREATE TABLE IF NOT EXISTS capital_prices (
     UNIQUE(period, region, measure)
 );
 
+CREATE TABLE IF NOT EXISTS state_drivers (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    period         TEXT    NOT NULL,   -- 'YYYY-QN'
+    measure        TEXT    NOT NULL,   -- net_interstate_migration | net_overseas_migration | natural_increase | population_change
+    value          REAL,
+    source         TEXT    NOT NULL DEFAULT 'ABS',
+    fetched_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(period, measure)
+);
+
 CREATE TABLE IF NOT EXISTS pipeline_runs (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     connector      TEXT    NOT NULL,
