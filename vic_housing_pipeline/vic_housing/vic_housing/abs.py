@@ -78,50 +78,62 @@ def _parse_sdmx(data: dict) -> list[dict]:
                     return i
             return None
 
+        # Keep only the dwelling-COUNT measure + residential building types.
+        DWELLING_MEASURE = "number of dwelling units"
+        DWELLING_TYPES = {
+            "houses": "house",
+            "dwellings excluding houses": "unit",
+            "total residential": "total",
+        }
+        PIN = {"VALUE": "total", "SECTOR": "total sectors", "WORK_TYPE": "total work"}
+        measure_idx  = dim_idx(series_dims, "MEASURE")
         region_idx   = dim_idx(series_dims, "REGION")
         btype_idx    = dim_idx(series_dims, "BUILDING_TYPE")
         tsest_idx    = dim_idx(series_dims, "TSEST")
-        time_values  = obs_dims[0]["values"]  # [{id: '2024-01', name: ...}, ...]
+        pin_idx      = {k: dim_idx(series_dims, k) for k in PIN}
+        time_values  = obs_dims[0]["values"]
 
-        dataset = data["data"]["dataSets"][0]
-        for series_key, series_data in dataset["series"].items():
+        for series_key, series_data in data["data"]["dataSets"][0]["series"].items():
             keys = series_key.split(":")
 
-            region = (
-                series_dims[region_idx]["values"][int(keys[region_idx])]["name"]
-                if region_idx is not None and int(keys[region_idx]) < len(series_dims[region_idx]["values"])
-                else "Australia"
-            )
+            # 1) dwelling COUNT only + pin sector/value/work-type to aggregates
+            if measure_idx is not None:
+                mname = series_dims[measure_idx]["values"][int(keys[measure_idx])]["name"].lower()
+                if mname != DWELLING_MEASURE:
+                    continue
+            if any(pin_idx[k] is not None and
+                   series_dims[pin_idx[k]]["values"][int(keys[pin_idx[k]])]["name"].lower() != v
+                   for k, v in PIN.items()):
+                continue
 
-            raw_btype = (
-                series_dims[btype_idx]["values"][int(keys[btype_idx])]["name"].lower()
-                if btype_idx is not None else "total"
-            )
-            if   "house" in raw_btype:                                     dtype = "house"
-            elif any(w in raw_btype for w in ("unit", "flat", "other")):   dtype = "unit"
-            elif "total" in raw_btype or raw_btype == "":                  dtype = "total"
-            else:                                                           dtype = raw_btype[:20]
+            # 2) this state's regions + national only
+            region = (series_dims[region_idx]["values"][int(keys[region_idx])]["name"]
+                      if region_idx is not None else "Australia")
+            if region.lower() not in KEEP_REGIONS:
+                continue
+
+            # 3) residential dwelling types only -> house / unit / total
+            btype = (series_dims[btype_idx]["values"][int(keys[btype_idx])]["name"].lower()
+                     if btype_idx is not None else "")
+            dtype = DWELLING_TYPES.get(btype)
+            if dtype is None:
+                continue
 
             seasonality = "original"
             if tsest_idx is not None:
-                tsest_name = series_dims[tsest_idx]["values"][int(keys[tsest_idx])]["name"].lower()
-                if "season" in tsest_name:  seasonality = "seasonally_adjusted"
-                elif "trend" in tsest_name: seasonality = "trend"
+                ts = series_dims[tsest_idx]["values"][int(keys[tsest_idx])]["name"].lower()
+                seasonality = ("seasonally_adjusted" if "season" in ts
+                               else "trend" if "trend" in ts else "original")
 
             for time_key, obs_vals in series_data.get("observations", {}).items():
-                t_idx  = int(time_key)
-                period = time_values[t_idx]["id"] if t_idx < len(time_values) else None
-                if period is None:
+                t_idx = int(time_key)
+                if t_idx >= len(time_values):
                     continue
                 value = obs_vals[0] if obs_vals else None
                 if value is None:
                     continue
-                # Filter: only keep VIC and national rows
-            if region.lower() not in KEEP_REGIONS:
-                continue
-
-            rows.append({
-                    "period":        period,
+                rows.append({
+                    "period":        time_values[t_idx]["id"],
                     "region":        region,
                     "dwelling_type": dtype,
                     "seasonality":   seasonality,
