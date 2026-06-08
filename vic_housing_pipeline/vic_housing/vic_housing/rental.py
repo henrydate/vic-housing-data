@@ -1,15 +1,25 @@
 """
-rental.py — DFFH Rental Report connector (RTBA bond data).
+rental.py -- DFFH Rental Report connector.
 
-Source: data.vic.gov.au — Department of Families, Fairness & Housing
-Dataset: "Rental Report — Quarterly data" (median weekly rents by suburb/LGA)
-Cadence: Quarterly
+Source: dffh.vic.gov.au publications page (live scrape -- no hardcoded URLs)
 
-Strategy:
-  1. Query CKAN for the RTBA rental report package.
-  2. Download each XLSX resource.
-  3. Parse median weekly rent by suburb, dwelling type, and quarter.
-  4. Upsert into rental_medians.
+DFFH Excel file structure (confirmed Sep 2025):
+  Sheets: '1 bedroom flat', '2 bedroom flat', '3 bedroom flat',
+          '2 bedroom house', '3 bedroom house', '4 bedroom house',
+          'All properties'
+
+  Row 0:  Title row (skip)
+  Row 1:  Quarter headers starting col 2 -- e.g. 'Mar 2000', 'Jun 2000', ...
+          Each quarter uses TWO columns (Count, Median), repeated ~104 times
+  Row 2:  'Count' / 'Median' alternating labels
+  Row 3+: Data rows
+          Col 0 = LGA name (only in first row of LGA group -- forward-fill)
+          Col 1 = Suburb / town name
+          Cols 2+ = Count, Median pairs for each quarter
+
+Key insight: each quarterly file is CUMULATIVE -- it contains ALL quarters
+from 2000 to the current quarter. We only need to download ONE file to get
+the full history.
 """
 
 from __future__ import annotations
@@ -17,152 +27,180 @@ from __future__ import annotations
 import re
 from io import BytesIO
 
-import openpyxl
+import pandas as pd
+from bs4 import BeautifulSoup
 
-from .core import build_session, cached_get, get_logger, upsert
+from .core import build_session, get_logger, upsert
 
 log = get_logger("rental")
 
-CKAN_BASE = "https://discover.data.vic.gov.au/api/3/action"
+DFFH_BASE         = "https://www.dffh.vic.gov.au"
+DFFH_CURRENT_PAGE = f"{DFFH_BASE}/publications/rental-report"
+DFFH_PAST_PAGE    = f"{DFFH_BASE}/publications/past-rental-reports"
 
-RENTAL_PACKAGE_IDS = [
-    "rental-report-quarterly-moving-annual-rents-by-suburb",
-    "rental-report-quarterly-bond-data-suburb",
-]
-
-BEDROOM_MAP = {
-    "1 bedroom": "1br", "1br": "1br", "one bedroom": "1br",
-    "2 bedroom": "2br", "2br": "2br", "two bedroom": "2br",
-    "3 bedroom": "3br", "3br": "3br", "three bedroom": "3br",
-    "4 bedroom": "4br", "4br": "4br",
-    "all":       "all", "total": "all",
+SHEET_TO_DWELLING = {
+    "1 bedroom flat":   "1br",
+    "2 bedroom flat":   "2br",
+    "3 bedroom flat":   "3br",
+    "2 bedroom house":  "2br_house",
+    "3 bedroom house":  "3br_house",
+    "4 bedroom house":  "4br",
+    "all properties":   "all",
 }
 
+MONTH_TO_Q = {"mar": "Q1", "jun": "Q2", "sep": "Q3", "dec": "Q4"}
 
-def _detect_period(text: str) -> str | None:
-    m = re.search(r"(\d{4})[-_ ]?q(\d)", text, re.I)
+
+def _date_to_period(s: str) -> str | None:
+    """Convert 'Mar 2000' -> '2000-Q1', etc."""
+    m = re.match(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+(\d{4})",
+                 str(s).lower())
     if m:
-        return f"{m.group(1)}-Q{m.group(2)}"
-    m = re.search(r"(\d{4})", text)
-    if m:
-        return m.group(1)
+        # Map any month to the nearest quarter end
+        month = m.group(1)[:3]
+        q_map = {
+            "jan": "Q1", "feb": "Q1", "mar": "Q1",
+            "apr": "Q2", "may": "Q2", "jun": "Q2",
+            "jul": "Q3", "aug": "Q3", "sep": "Q3",
+            "oct": "Q4", "nov": "Q4", "dec": "Q4",
+        }
+        return f"{m.group(2)}-{q_map.get(month, 'Q?')}"
     return None
 
 
-def _detect_bedroom_type(text: str) -> str:
-    t = text.lower()
-    for kw, btype in BEDROOM_MAP.items():
-        if kw in t:
-            return btype
-    return "all"
-
-
-def _find_header_row(ws) -> int | None:
-    for row in ws.iter_rows(max_row=20):
-        for cell in row:
-            v = str(cell.value or "").lower()
-            if "suburb" in v or "lga" in v or "median" in v or "rent" in v:
-                return cell.row
+def _get_latest_suburb_url(session) -> str | None:
+    """
+    Scrape DFFH publications pages to find the most recent
+    'moving-annual-rent*suburb*' Excel file URL.
+    Downloads that one file which contains ALL quarters (2000-present).
+    """
+    for page_url in (DFFH_CURRENT_PAGE, DFFH_PAST_PAGE):
+        try:
+            r = session.get(page_url, timeout=15)
+            r.raise_for_status()
+            soup = BeautifulSoup(r.content, "lxml")
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if "moving-annual-rent" in href.lower() and "suburb" in href.lower():
+                    full = href if href.startswith("http") else f"{DFFH_BASE}{href}"
+                    log.info(f"  Latest suburb file link: {full}")
+                    return full
+        except Exception as e:
+            log.warning(f"  Could not scrape {page_url}: {e}")
     return None
 
 
-def _parse_sheet(ws, period: str, dwelling_type: str) -> list[dict]:
-    header_row = _find_header_row(ws)
-    if header_row is None:
+def _parse_dffh_sheet(df: pd.DataFrame, dwelling_type: str) -> list[dict]:
+    """
+    Parse one sheet of the DFFH cumulative wide-format Excel file.
+    Extracts ALL quarters (median rent per suburb per quarter).
+    """
+    if df.shape[0] < 4 or df.shape[1] < 4:
         return []
 
-    headers = [str(ws.cell(header_row, c).value or "").lower().strip()
-               for c in range(1, ws.max_column + 1)]
+    # Row 1 = quarter date labels (starting col 2)
+    # Row 2 = 'Count' / 'Median' alternating
+    date_row = df.iloc[1]
+    cm_row   = df.iloc[2]
 
-    def col(keyword: str) -> int | None:
-        for i, h in enumerate(headers):
-            if keyword in h:
-                return i
-        return None
+    # Map column index -> (period_str, is_median)
+    median_cols: dict[int, str] = {}
+    current_period = None
+    for c in range(2, df.shape[1]):
+        dv = date_row.iloc[c]
+        cv = str(cm_row.iloc[c]).lower().strip() if pd.notna(cm_row.iloc[c]) else ""
 
-    suburb_col = col("suburb")
-    lga_col    = col("lga") or col("local government")
-    median_col = col("median") or col("rent")
+        if pd.notna(dv):
+            current_period = _date_to_period(str(dv))
 
-    if median_col is None:
+        if current_period and "median" in cv:
+            median_cols[c] = current_period
+
+    if not median_cols:
         return []
 
     rows = []
-    for r in range(header_row + 1, ws.max_row + 1):
-        suburb = ws.cell(r, (suburb_col or 0) + 1).value if suburb_col is not None else None
-        lga    = ws.cell(r, (lga_col or 0) + 1).value    if lga_col    is not None else None
-        median = ws.cell(r, median_col + 1).value
+    current_lga = None
 
-        if median is None:
+    for i in range(3, len(df)):
+        row = df.iloc[i]
+
+        # Forward-fill LGA (col 0 only populated for first suburb in each LGA)
+        lga_val = row.iloc[0]
+        if pd.notna(lga_val) and str(lga_val).strip() not in ("", "nan"):
+            current_lga = str(lga_val).strip()
+
+        suburb_val = row.iloc[1]
+        if pd.isna(suburb_val):
             continue
-        try:
-            median = float(str(median).replace(",", "").replace("$", "").strip())
-        except ValueError:
+        suburb = str(suburb_val).strip()
+        if not suburb or suburb.lower() in ("nan", "none", "suburb", ""):
             continue
 
-        rows.append({
-            "period":        period,
-            "lga":           str(lga).strip()    if lga    else None,
-            "suburb":        str(suburb).strip() if suburb else None,
-            "dwelling_type": dwelling_type,
-            "median_rent":   median,
-        })
+        for col_idx, period in median_cols.items():
+            val = row.iloc[col_idx]
+            if pd.isna(val):
+                continue
+            try:
+                rent = float(str(val).replace(",", "").strip())
+            except (ValueError, TypeError):
+                continue
+            if rent <= 0:
+                continue
+
+            rows.append({
+                "period":        period,
+                "lga":           current_lga,
+                "suburb":        suburb,
+                "dwelling_type": dwelling_type,
+                "median_rent":   rent,
+            })
+
     return rows
-
-
-def _process_resource(session, resource: dict) -> list[dict]:
-    url  = resource.get("url", "")
-    name = resource.get("name", "") or resource.get("description", "")
-
-    if not url.lower().endswith((".xlsx", ".xls")):
-        return []
-
-    period        = _detect_period(url) or _detect_period(name) or "unknown"
-    dwelling_type = _detect_bedroom_type(url + " " + name)
-
-    log.info(f"  Downloading: {url} → period={period} type={dwelling_type}")
-    resp = cached_get(session, url)
-    if resp is None:
-        return []
-
-    try:
-        wb = openpyxl.load_workbook(BytesIO(resp.content), read_only=True, data_only=True)
-    except Exception as e:
-        log.warning(f"  Could not open workbook {url}: {e}")
-        return []
-
-    all_rows = []
-    for ws in wb.worksheets:
-        sheet_type   = _detect_bedroom_type(ws.title) if ws.title else dwelling_type
-        sheet_period = _detect_period(ws.title) or period
-        rows         = _parse_sheet(ws, sheet_period, sheet_type)
-        all_rows.extend(rows)
-
-    return all_rows
 
 
 def run() -> int:
     session  = build_session()
     all_rows = []
 
-    for pkg_id in RENTAL_PACKAGE_IDS:
-        log.info(f"Querying CKAN package: {pkg_id}")
-        resp = cached_get(session, f"{CKAN_BASE}/package_show", params={"id": pkg_id})
-        if resp is None:
-            log.warning(f"  Could not fetch package for {pkg_id}")
-            continue
+    # --- Step 1: find latest suburb Excel URL ---------------------------------
+    log.info("Locating latest DFFH rental Excel file...")
+    page_url = _get_latest_suburb_url(session)
+    if not page_url:
+        log.warning("  Could not find DFFH suburb rental URL")
+        return 0
 
-        try:
-            data      = resp.json()
-            resources = data["result"]["resources"]
-        except Exception as e:
-            log.warning(f"  Malformed response for {pkg_id}: {e}")
-            continue
+    # --- Step 2: download (the page redirects directly to .xlsx) -------------
+    log.info(f"  Downloading: {page_url}")
+    try:
+        r = session.get(page_url, timeout=60, allow_redirects=True)
+        r.raise_for_status()
+        content = r.content
+        log.info(f"  Downloaded {len(content):,} bytes from {r.url[-60:]}")
+    except Exception as e:
+        log.warning(f"  Download failed: {e}")
+        return 0
 
-        for resource in resources:
-            rows = _process_resource(session, resource)
-            all_rows.extend(rows)
+    # Verify it's a real xlsx
+    if content[:4] != b"PK\x03\x04":
+        log.warning(f"  Not a valid xlsx file (magic: {content[:4].hex()})")
+        return 0
+
+    # --- Step 3: parse all sheets --------------------------------------------
+    try:
+        sheets = pd.read_excel(BytesIO(content), sheet_name=None,
+                               header=None, engine="openpyxl")
+    except Exception as e:
+        log.warning(f"  Could not open workbook: {e}")
+        return 0
+
+    log.info(f"  Sheets: {list(sheets.keys())}")
+    for sheet_name, df in sheets.items():
+        dwelling_type = SHEET_TO_DWELLING.get(sheet_name.lower().strip(), "all")
+        rows = _parse_dffh_sheet(df, dwelling_type)
+        log.info(f"    Sheet '{sheet_name}' ({dwelling_type}): {len(rows):,} rows")
+        all_rows.extend(rows)
 
     new = upsert("rental_medians", all_rows, ["period", "lga", "suburb", "dwelling_type"])
-    log.info(f"Rental: {len(all_rows)} rows parsed → {new} new inserted")
+    log.info(f"Rental: {len(all_rows):,} rows -> {new:,} new inserted")
     return new

@@ -1,21 +1,36 @@
-  # Python
-  __pycache__/
-  *.py[cod]
-  *.egg-info/
-  .ipynb_checkpoints/
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
 
-  # Environments
-  .env
-  .venv/
-  venv/
-  env/
+# Environments
+.env
+.venv/
+venv/
+env/
 
-  # Data — keep large/raw dumps out of the repo
-  data/
-  *.parquet
-  # (to allow one small sample: add a line like  !data/sample.csv )
+# Generated database (regenerate with `python -m vic_housing.pipeline`)
+*.db
+*.db-wal
+*.db-shm
 
-  # OS / IDE
-  .DS_Store
-  .idea/
-  .vscode/
+# HTTP cache + logs
+**/cache/
+**/logs/*.log
+
+# Bulky regenerable exports (keep .gitkeep + analysis charts)
+**/exports/*.csv
+**/exports/*.xlsx
+exports/analysis/*.csv
+
+# Scratch
+Untitled*.ipynb
+
+# Editor/agent config with machine-specific absolute paths
+.claude/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/

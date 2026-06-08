@@ -24,17 +24,19 @@ from typing import Callable
 
 from . import vgv, rental, exports
 from . import abs as abs_mod
-from . import rba, asx
+from . import rba, asx, cashrate, capitals
 from .core import init_db, get_conn, get_logger
 
 log = get_logger("pipeline")
 
 CONNECTORS: dict[str, Callable[[], int]] = {
-    "vgv":    vgv.run,
-    "rental": rental.run,
-    "abs":    abs_mod.run,
-    "rba":    rba.run,
-    "asx":    asx.run,
+    "vgv":      vgv.run,
+    "rental":   rental.run,
+    "abs":      abs_mod.run,
+    "rba":      rba.run,
+    "asx":      asx.run,
+    "cashrate": cashrate.run,
+    "capitals": capitals.run,
 }
 
 

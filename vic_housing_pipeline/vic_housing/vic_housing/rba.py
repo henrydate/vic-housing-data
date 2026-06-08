@@ -1,132 +1,156 @@
 """
-rba.py — RBA Statistical Tables connector.
+rba.py -- RBA Statistical Tables connector.
 
-Sources (CSV):
-  F5  — Indicator Lending Rates (owner-occupier & investor, P&I and IO)
-  F6  — Housing Loan Commitments
-  F7  — Variable Housing Lending Rates
+Files (XLSX, no auth required):
+  F5  f05hist.xlsx  Indicator Lending Rates
+  F6  f06hist.xlsx  Housing Lending Rates (OO vs Investor / P&I vs IO)  <- key table
+  F7  f07hist.xlsx  Business Lending Rates (opt-in via RBA_INCLUDE_F7=true)
 
-These are the series most relevant to rent-vs-buy modelling and property
-research. All are publicly available and update monthly.
+RBA XLSX structure (confirmed):
+  Row 0:  Table title  (e.g. "F5  INDICATOR LENDING RATES")
+  Row 1:  "Title"       + series titles
+  Row 2:  "Description" + series descriptions      <- use for labels
+  Row 3:  "Frequency"
+  Row 4:  "Type"
+  Row 5:  "Units"
+  Row 6-7: blank
+  Row 8:  "Source"
+  Row 9:  "Publication date"
+  Row 10: "Series ID"  + actual series IDs         <- dynamically detected
+  Row 11+: data rows   (col 0 = datetime object, cols 1+ = float values)
 """
 
 from __future__ import annotations
 
-import csv
-import io
+import datetime
+import os
 import re
+from io import BytesIO
 
-from .core import build_session, cached_get, get_logger, upsert
+from .core import build_session, get_logger, upsert
 
 log = get_logger("rba")
 
-RBA_BASE = "https://www.rba.gov.au/statistics/tables"
+RBA_XLS_BASE = "https://www.rba.gov.au/statistics/tables/xls"
 
 SERIES = {
     "F5": {
-        "url":   f"{RBA_BASE}/f5.1-data.csv",
-        "label": "Indicator Lending Rates",
+        "url":     f"{RBA_XLS_BASE}/f05hist.xlsx",
+        "label":   "Indicator Lending Rates",
+        "primary": True,
     },
     "F6": {
-        "url":   f"{RBA_BASE}/f6-data.csv",
-        "label": "Housing Loan Commitments",
+        "url":     f"{RBA_XLS_BASE}/f06hist.xlsx",
+        "label":   "Housing Lending Rates (OO vs Investor / P&I vs IO)",
+        "primary": True,
     },
     "F7": {
-        "url":   f"{RBA_BASE}/f7-data.csv",
-        "label": "Variable Housing Lending Rates",
+        "url":     f"{RBA_XLS_BASE}/f07hist.xlsx",
+        "label":   "Business Lending Rates (by firm size)",
+        "primary": False,  # set RBA_INCLUDE_F7=true to enable
     },
 }
 
-# Only persist series whose IDs contain these substrings
-SERIES_FILTER = [
-    "FILRHLB",   # Housing lending rate benchmarks
-    "FILRHLO",   # Owner-occupier
-    "FILRHLI",   # Investor
-    "FILRHLP",   # P&I
-    "FILRHLL",   # IO
-    "HHCLOAN",   # Housing loan commitments
-    "SVRATE",    # Standard variable rate
-]
+INCLUDE_F7 = os.getenv("RBA_INCLUDE_F7", "false").lower() == "true"
 
 
-def _matches_filter(series_id: str) -> bool:
-    sid = series_id.upper()
-    return any(f in sid for f in SERIES_FILTER) or True  # keep all by default
-
-
-def _parse_rba_csv(text: str, table_id: str) -> list[dict]:
+def _parse_rba_xlsx(content: bytes, table_id: str) -> list[dict]:
     """
-    RBA CSVs have a metadata header block followed by data rows.
-    Format:
-        Row 1:  Series ID    | ID1  | ID2  | ...
-        Row 2:  Description  | desc | desc | ...
-        Row 3:  Frequency    | ...
-        Row 4:  Type         | ...
-        Row 5:  Units        | ...
-        Row 6+: data         | YYYY-Mon | val | val | ...
+    Parse an RBA historical XLSX file.
+    Dynamically locates the 'Series ID' row and 'Description' row
+    rather than assuming fixed row numbers.
+    Handles datetime objects in the date column.
     """
+    from openpyxl import load_workbook
+
     rows_out = []
-    reader   = csv.reader(io.StringIO(text))
-    lines    = list(reader)
+    try:
+        wb = load_workbook(BytesIO(content), read_only=True, data_only=True)
+        ws = wb.active
+        all_rows = list(ws.iter_rows(values_only=True))
 
-    if len(lines) < 6:
-        log.warning(f"  {table_id}: too few rows in CSV ({len(lines)})")
-        return []
+        if len(all_rows) < 5:
+            log.warning(f"  {table_id}: too few rows ({len(all_rows)})")
+            return []
 
-    # Row 0: series IDs
-    series_ids = lines[0]
-    # Row 1: descriptions
-    descriptions = lines[1] if len(lines) > 1 else [""] * len(series_ids)
+        # -- Locate key rows ---------------------------------------------------
+        series_id_row_idx   = None
+        description_row_idx = None
 
-    # Data starts after the metadata block — find the first row where col[0] looks like a date
-    data_start = None
-    for i, row in enumerate(lines):
-        if row and re.match(r"\d{4}", row[0].strip()):
-            data_start = i
-            break
-
-    if data_start is None:
-        log.warning(f"  {table_id}: could not find data rows")
-        return []
-
-    for row in lines[data_start:]:
-        if not row or not row[0].strip():
-            continue
-        # Parse period: RBA uses "YYYY-Mon" or "YYYY-MM"
-        raw_period = row[0].strip()
-        m = re.match(r"(\d{4})-([A-Za-z]{3})", raw_period)
-        if m:
-            month_map = {
-                "Jan": "01", "Feb": "02", "Mar": "03", "Apr": "04",
-                "May": "05", "Jun": "06", "Jul": "07", "Aug": "08",
-                "Sep": "09", "Oct": "10", "Nov": "11", "Dec": "12",
-            }
-            period = f"{m.group(1)}-{month_map.get(m.group(2), '01')}"
-        else:
-            m2 = re.match(r"(\d{4})-(\d{2})", raw_period)
-            period = f"{m2.group(1)}-{m2.group(2)}" if m2 else raw_period
-
-        for col_idx in range(1, len(row)):
-            if col_idx >= len(series_ids):
-                break
-            series_id = series_ids[col_idx].strip()
-            if not series_id:
+        for i, row in enumerate(all_rows):
+            if not row or row[0] is None:
                 continue
-            label = descriptions[col_idx].strip() if col_idx < len(descriptions) else ""
-            val   = row[col_idx].strip()
-            if not val or val in ("", "..", "na", "NA", "N/A"):
-                continue
-            try:
-                rate = float(val)
-            except ValueError:
+            cell0 = str(row[0]).strip().strip("'").lower()
+            if cell0 == "series id":
+                series_id_row_idx = i
+            elif cell0 in ("description", "title") and description_row_idx is None:
+                description_row_idx = i
+
+        if series_id_row_idx is None:
+            log.warning(f"  {table_id}: 'Series ID' row not found")
+            return []
+
+        series_ids   = [str(v or "").strip().strip("'") for v in all_rows[series_id_row_idx]]
+        descriptions = (
+            [str(v or "").strip().strip("'") for v in all_rows[description_row_idx]]
+            if description_row_idx is not None
+            else [""] * len(series_ids)
+        )
+
+        month_map = {
+            "Jan": "01", "Feb": "02", "Mar": "03", "Apr": "04",
+            "May": "05", "Jun": "06", "Jul": "07", "Aug": "08",
+            "Sep": "09", "Oct": "10", "Nov": "11", "Dec": "12",
+        }
+
+        # -- Parse data rows (everything after the Series ID row) --------------
+        for row in all_rows[series_id_row_idx + 1:]:
+            if not row or row[0] is None:
                 continue
 
-            rows_out.append({
-                "period":       period,
-                "series_id":    series_id,
-                "series_label": label or f"{table_id}/{series_id}",
-                "rate_pct":     rate,
-            })
+            date_val = row[0]
+
+            # openpyxl returns date cells as datetime objects
+            if isinstance(date_val, (datetime.datetime, datetime.date)):
+                period = date_val.strftime("%Y-%m")
+            else:
+                raw = str(date_val).strip().strip("'")
+                m = re.match(r"(\d{4})-([A-Za-z]{3})", raw)
+                if m:
+                    period = f"{m.group(1)}-{month_map.get(m.group(2), '01')}"
+                else:
+                    m2 = re.match(r"(\d{4})-(\d{2})", raw)
+                    if m2:
+                        period = f"{m2.group(1)}-{m2.group(2)}"
+                    else:
+                        continue  # not a date row
+
+            for col_idx in range(1, len(row)):
+                if col_idx >= len(series_ids):
+                    break
+                series_id = series_ids[col_idx]
+                if not series_id or series_id in ("None", ""):
+                    continue
+
+                label = descriptions[col_idx] if col_idx < len(descriptions) else ""
+                val   = row[col_idx]
+
+                if val is None or str(val).strip() in ("", "..", "na", "NA"):
+                    continue
+                try:
+                    rate = float(val)
+                except (ValueError, TypeError):
+                    continue
+
+                rows_out.append({
+                    "period":       period,
+                    "series_id":    f"{table_id}/{series_id}",
+                    "series_label": label or f"{table_id}/{series_id}",
+                    "rate_pct":     rate,
+                })
+
+    except Exception as e:
+        log.warning(f"  {table_id}: XLSX parse error: {e}")
 
     return rows_out
 
@@ -136,16 +160,22 @@ def run() -> int:
     all_rows = []
 
     for table_id, meta in SERIES.items():
-        log.info(f"Fetching RBA {table_id}: {meta['label']}")
-        resp = cached_get(session, meta["url"])
-        if resp is None:
-            log.warning(f"  {table_id}: fetch failed")
+        if not meta["primary"] and not INCLUDE_F7:
+            log.info(f"Skipping {table_id} ({meta['label']}) -- set RBA_INCLUDE_F7=true to enable")
             continue
 
-        rows = _parse_rba_csv(resp.text, table_id)
-        log.info(f"  {table_id}: {len(rows)} observations parsed")
+        log.info(f"Fetching RBA {table_id}: {meta['label']}")
+        try:
+            r = session.get(meta["url"], timeout=60)
+            r.raise_for_status()
+        except Exception as e:
+            log.warning(f"  {table_id}: fetch failed: {e}")
+            continue
+
+        rows = _parse_rba_xlsx(r.content, table_id)
+        log.info(f"  {table_id}: {len(rows)} observations")
         all_rows.extend(rows)
 
     new = upsert("lending_rates", all_rows, ["period", "series_id"])
-    log.info(f"RBA: {len(all_rows)} rows parsed → {new} new inserted")
+    log.info(f"RBA: {len(all_rows)} rows -> {new} new inserted")
     return new

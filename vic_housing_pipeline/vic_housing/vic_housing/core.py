@@ -72,9 +72,13 @@ def build_session() -> requests.Session:
     session.mount("http://", adapter)
     session.headers.update({
         "User-Agent": (
-            "vic-housing-pipeline/1.0 "
-            "(open-source research tool; github.com/yourname/vic-housing-data)"
-        )
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-AU,en;q=0.9",
+        "Referer":         "https://discover.data.vic.gov.au/",
     })
     return session
 
@@ -190,6 +194,26 @@ CREATE TABLE IF NOT EXISTS asx_announcements (
     source         TEXT    NOT NULL DEFAULT 'ASX',
     fetched_at     TEXT    NOT NULL DEFAULT (datetime('now')),
     UNIQUE(ticker, announced_at, headline)
+);
+
+CREATE TABLE IF NOT EXISTS cash_rate (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    period         TEXT    NOT NULL,   -- 'YYYY-MM' (monthly)
+    rate_pct       REAL,
+    source         TEXT    NOT NULL DEFAULT 'RBA',
+    fetched_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(period)
+);
+
+CREATE TABLE IF NOT EXISTS capital_prices (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    period         TEXT    NOT NULL,   -- 'YYYY-QN'
+    region         TEXT    NOT NULL,   -- e.g. 'Greater Melbourne'
+    measure        TEXT    NOT NULL,   -- 'median_house' | 'median_unit' | 'count_house' | 'count_unit'
+    value          REAL,
+    source         TEXT    NOT NULL DEFAULT 'ABS',
+    fetched_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(period, region, measure)
 );
 
 CREATE TABLE IF NOT EXISTS pipeline_runs (
